@@ -1,0 +1,2 @@
+a09d896d69fe485fcfdd71a315f9dd6efa68a3d426421fd7dda5df02ceb76e0b  OurDLP-postgres-source.zip
+3ae85fb0867cfa5d9e156a9568784b4788c7887af307b1d2558c2f9a6c833d54  OurDLP-postgres-win-x64.zip
