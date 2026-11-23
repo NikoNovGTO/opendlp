@@ -1,0 +1,2 @@
+f3d3f3a98021867a6ce8744b816b73ed4b8d7c259bca95b7e57999eb502768c3  OurDLP-connected-source.zip
+c302799132145f5edd30e54118b56eff2cc8c31adaf17d2fc958617f21e6272c  OurDLP-connected-win-x64.zip
