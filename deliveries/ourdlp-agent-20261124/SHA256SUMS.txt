@@ -1,0 +1,3 @@
+5f65a04c40108697bba751c892336462969d710e899d733a5c59d7a22f54f865  OurDLP-agent-source.zip
+d0ac3e4b49fdaee1d6aa55462ce8e97e83343277c70fd83f0f168af5fba059dc  OurDLP-server-desktop-win-x64.zip
+496a6b9386e4738e7ec483021deab667842731defa7178379616a1d151ad86dc  OurDLP-agent-win-x64.zip
