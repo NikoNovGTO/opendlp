@@ -1,0 +1,2 @@
+23294aa0da7c66ce799613b3801baf569d4d3506d3c656036e5aca24e21a1fe3  OurDLP-scanning-source.zip
+82b459eebe0adcf2d535ab3a32418ca420b1aac1a00ee91b3ed82ca553f26f7d  OurDLP-scanning-win-x64.zip
