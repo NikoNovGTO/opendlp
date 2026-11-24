@@ -1,0 +1,3 @@
+81df46a4506d03feb6a9e2a68d8c3732cab290606afc62b8d3f16f8521afb69d  OurDLP-remote-source.zip
+bc351e9e21dd121ec42d091341f80d4123e6f3588310797f8ea0894c37368e92  OurDLP-remote-server-desktop-win-x64.zip
+d4fe8dfd5ef7af082869f3f078eb7431f5a50d23169473cefc526d972f750f35  OurDLP-remote-agent-win-x64.zip
