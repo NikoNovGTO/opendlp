@@ -1,0 +1,2 @@
+a74edee9d5b15ca697701bd2ef01acf2e0e2c60dbe1efcee7c0220b35554700f  OurDLP-auth-source.zip
+79c7e0538eeeea8193b78549a3bb421589c9cf4dfa0a638d9861fab0a0e981e9  OurDLP-auth-win-x64.zip
