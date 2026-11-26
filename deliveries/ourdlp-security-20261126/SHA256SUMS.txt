@@ -1,0 +1,3 @@
+880699c0a50516f1de2374e105437e4125144ff6978bc6e82da3d39c7acdc066  OurDLP-security-source.zip
+c4fd25ce17c625349b9bbbeb1de4b138451221240563f242457bed6e2569644f  OurDLP-security-win-x64.zip
+0eb601b98a9b3cbe995aee9df8d323ac5448a2da2c9503d2a6dd8ecaa2a82c33  OurDLP-security-update.zip
