@@ -1,0 +1,832 @@
+--- a/OurDLP/DEMONSTRATION.md
++++ b/OurDLP/DEMONSTRATION.md
+@@ -1,6 +1,6 @@
+-# Демонстрационный комплект OurDLP 0.9.0
++# Демонстрационный комплект OurDLP 0.9.1
+ 
+-Для демонстрации используйте **OurDLP-design-win-x64.zip**. В нём сервер, консоль, агент, пользовательский компонент, включённые .NET runtime и окно запуска **ЗАПУСТИТЬ.cmd**. Visual Studio/SDK для готового комплекта не нужны. PostgreSQL 17 остаётся внешней зависимостью. Это настоящий сервер/API/PostgreSQL/агент, без подставных событий.
++Для демонстрации используйте **OurDLP-light-win-x64.zip**. В нём сервер, консоль, агент, пользовательский компонент, включённые .NET runtime и окно запуска **ЗАПУСТИТЬ.cmd**. Visual Studio/SDK для готового комплекта не нужны. PostgreSQL 17 остаётся внешней зависимостью. Это настоящий сервер/API/PostgreSQL/агент, без подставных событий.
+ 
+ Порядок первого запуска и показа находится в ЧИТАТЬ.txt и ПОКАЗ.txt. Исходный текст этих инструкций — demo/. Окно запуска WinForms разделено на DemoCommon, DemoPayload, DemoProcesses, Prepare-Demo, Install-DemoAgent и Start-Demo. Во время повышения прав проверяется SID пользователя, чтобы подготовка под другим администратором не изменила чужой профиль. Пользовательский компонент запускается только обычным пользователем.
+ 
+@@ -16,4 +16,6 @@
+ 
+ Проверка в облаке не заменяет нативный прогон: окно запуска, WPF/WinForms, Windows PowerShell 5.1, UAC, сертификаты/ACL/SCM/DPAPI/ярлыки и настоящий clipboard ещё требуют испытания на Windows. Перед публичным показом пройдите сценарий на одном ПК.
+ 
+-В 0.9.0 инструкция доступна прямо в окне запуска и в консоли по F1; подробнее — GUIDE.md. При смене комплекта сначала остановите свой сервер кнопкой прежнего окна и закройте старую консоль/окно запуска.
++В 0.9.1 инструкция доступна прямо в окне запуска и в консоли по F1; подробнее — GUIDE.md. При смене комплекта сначала остановите свой сервер кнопкой прежнего окна и закройте старую консоль/окно запуска.
++
++После перехода на 0.9.1 обновите установленный агент и откройте компонент буфера. Для замера нагрузки используйте новую кнопку в launcher; подробности — PERFORMANCE.md.
+--- a/OurDLP/OurDLP.Agent/AgentProtocolClient.cs
++++ b/OurDLP/OurDLP.Agent/AgentProtocolClient.cs
+@@ -14,7 +14,7 @@
+ 
+ public sealed class AgentProtocolClient(HttpClient http)
+ {
+-    public static AgentHeartbeatRequest Metadata() => new(Environment.MachineName, RuntimeInformation.OSDescription, "0.8.2");
++    public static AgentHeartbeatRequest Metadata() => new(Environment.MachineName, RuntimeInformation.OSDescription, "0.9.1");
+     public Task<AgentCallResult> EnrollAsync(AgentState state, string code, CancellationToken token)
+     {
+         var metadata = Metadata();
+--- a/OurDLP/OurDLP.Agent/Clipboard/ClipboardAgentCoordinator.cs
++++ b/OurDLP/OurDLP.Agent/Clipboard/ClipboardAgentCoordinator.cs
+@@ -10,6 +10,8 @@
+     private readonly SemaphoreSlim _gate = new(1, 1);
+     private readonly Dictionary<string, ClipboardHelperStatus> _helpers = [];
+     private ClipboardAgentState? _state;
++    private CompiledClipboardPolicy? _validatedPolicy;
++    private bool _persisted;
+     public static string Key(AgentState state) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(state.ServerAddress + "\n" + state.DeviceId + "\n" + state.Token)));
+     private async Task<ClipboardAgentState> LoadAsync(CancellationToken token)
+     {
+@@ -19,6 +21,7 @@
+         var key = Key(identity); var saved = await store.ReadAsync(token);
+         if (saved is not null && saved.RegistrationKey != key) { await store.ArchiveAsync(token); saved = null; }
+         if (saved is not null && (saved.SchemaVersion != 1 || saved.Pending is null || saved.Pending.Count > 512)) throw new InvalidDataException("Очередь буфера повреждена.");
++        _persisted = saved is not null;
+         return _state = saved ?? new() { RegistrationKey = key };
+     }
+     public async Task<ClipboardSessionResponse> SessionAsync(ClipboardPeer peer, ClipboardSessionRequest request, CancellationToken token)
+@@ -29,8 +32,9 @@
+         try
+         {
+             var current = await LoadAsync(token); var accepted = new List<Guid>(); var rejected = new List<ClipboardEventRejection>(); var full = false;
+-            if (request.RegistrationKey == current.RegistrationKey)
++            if (request.RegistrationKey == current.RegistrationKey && request.Events.Count != 0)
+             {
++                var added = false;
+                 var pending = current.Pending.ToList();
+                 foreach (var item in request.Events)
+                 {
+@@ -46,16 +50,17 @@
+                     var stamped = new ClipboardEvent(item, peer.UserSid, peer.UserName, item.OriginSessionId > 0 ? item.OriginSessionId : peer.SessionId);
+                     var candidate = current with { Pending = pending.Append(stamped).ToArray() };
+                     if (Encoding.UTF8.GetByteCount(ScanWire.Serialize(candidate)) > 1900 * 1024) { full = true; break; }
+-                    pending.Add(stamped); accepted.Add(item.Id);
++                    pending.Add(stamped); accepted.Add(item.Id); added = true;
+                 }
+                 var updated = current with { Pending = pending.ToArray() };
+-                if (accepted.Count > 0) { await store.SaveAsync(updated, token); _state = current = updated; }
++                if (added) { await store.SaveAsync(updated, token); _state = current = updated; _persisted = true; }
+             }
+             var helper = new ClipboardHelperStatus(peer.UserSid, peer.UserName, peer.SessionId,
+                 request.RegistrationKey == current.RegistrationKey ? request.AppliedPolicyId : null,
+                 request.RegistrationKey == current.RegistrationKey ? request.AppliedVersion : null, DateTimeOffset.UtcNow, request.DroppedCaptures);
+             _helpers[peer.UserSid + "/" + peer.SessionId] = helper;
+-            foreach (var stale in _helpers.OrderByDescending(row => row.Value.LastSeenAtUtc).Skip(16).Select(row => row.Key).ToArray()) _helpers.Remove(stale);
++            if (_helpers.Count > 16)
++                foreach (var stale in _helpers.OrderByDescending(row => row.Value.LastSeenAtUtc).Skip(16).Select(row => row.Key).ToArray()) _helpers.Remove(stale);
+             return new(current.RegistrationKey, current.Policy, accepted, rejected, full);
+         }
+         finally { _gate.Release(); }
+@@ -72,7 +77,6 @@
+     }
+     public async Task ApplyAsync(ClipboardAgentResponse response, IReadOnlyList<Guid> sent, CancellationToken token)
+     {
+-        if (response.Policy is not null) _ = new CompiledClipboardPolicy(response.Policy);
+         if (response.Accepted is null || response.Rejected is null || response.Accepted.Count > ClipboardWire.MaxBatch || response.Rejected.Count > ClipboardWire.MaxBatch)
+             throw new InvalidDataException("Неверное подтверждение событий.");
+         if (response.Accepted.Concat(response.Rejected.Select(row => row.Id)).Any(id => !sent.Contains(id)))
+@@ -80,10 +84,17 @@
+         await _gate.WaitAsync(token);
+         try
+         {
+-            var state = await LoadAsync(token); var done = response.Accepted.Concat(response.Rejected.Select(row => row.Id)).ToHashSet();
+-            var updated = state with { Policy = response.Policy, Pending = state.Pending.Where(row => !done.Contains(row.Detection.Id)).ToArray(),
+-                RejectedEvents = state.RejectedEvents + state.Pending.Count(row => response.Rejected.Any(rejected => rejected.Id == row.Detection.Id)) };
+-            await store.SaveAsync(updated, token); _state = updated;
++            var state = await LoadAsync(token);
++            var compiled = response.Policy is null ? null
++                : _validatedPolicy is not null && ClipboardPolicyContent.Same(_validatedPolicy.Definition, response.Policy)
++                    ? _validatedPolicy : new CompiledClipboardPolicy(response.Policy);
++            var done = response.Accepted.Concat(response.Rejected.Select(row => row.Id)).ToHashSet();
++            var rejected = response.Rejected.Select(row => row.Id).ToHashSet();
++            if (_persisted && ClipboardPolicyContent.Same(state.Policy, response.Policy) && !state.Pending.Any(row => done.Contains(row.Detection.Id)))
++            { _validatedPolicy = compiled; return; }
++            var updated = state with { Policy = compiled?.Definition, Pending = state.Pending.Where(row => !done.Contains(row.Detection.Id)).ToArray(),
++                RejectedEvents = state.RejectedEvents + state.Pending.Count(row => rejected.Contains(row.Detection.Id)) };
++            await store.SaveAsync(updated, token); _state = updated; _persisted = true; _validatedPolicy = compiled;
+         }
+         finally { _gate.Release(); }
+     }
+--- a/OurDLP/OurDLP.Agent/OurDLP.Agent.csproj
++++ b/OurDLP/OurDLP.Agent/OurDLP.Agent.csproj
+@@ -1,5 +1,5 @@
+ <Project Sdk="Microsoft.NET.Sdk">
+-  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
++  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings><Version>0.9.1</Version><ServerGarbageCollection>false</ServerGarbageCollection></PropertyGroup>
+   <ItemGroup>
+     <ProjectReference Include="../OurDLP.Contracts/OurDLP.Contracts.csproj" />
+     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.15" />
+--- /dev/null
++++ b/OurDLP/OurDLP.Core/Clipboard/ClipboardPolicyContent.cs
+@@ -0,0 +1,13 @@
++namespace OurDLP.Core.Clipboard;
++
++/// <summary>Compares every persisted policy field, including ordered rule content.</summary>
++public static class ClipboardPolicyContent
++{
++    public static bool Same(ClipboardPolicy? left, ClipboardPolicy? right)
++    {
++        if (left is null || right is null) return left is null && right is null;
++        return left.Id == right.Id && left.Version == right.Version && left.Name == right.Name
++            && left.Enabled == right.Enabled && left.MaxTextCharacters == right.MaxTextCharacters
++            && left.Rules is not null && right.Rules is not null && left.Rules.SequenceEqual(right.Rules);
++    }
++}
+--- a/OurDLP/OurDLP.Core/Scanning/FileScanner.cs
++++ b/OurDLP/OurDLP.Core/Scanning/FileScanner.cs
+@@ -10,6 +10,7 @@
+ 
+     private static ScanReport Run(PreparedScan prepared, IProgress<ScanProgress>? progress, CancellationToken token)
+     {
++        using var priority = new ScanThreadPriority();
+         var session = new ScanSession(prepared, progress, token);
+         var attempted = 0;
+         foreach (var path in ScanTraversal.Files(session))
+--- a/OurDLP/OurDLP.Core/Scanning/RuleMatcher.cs
++++ b/OurDLP/OurDLP.Core/Scanning/RuleMatcher.cs
+@@ -12,7 +12,7 @@
+             var count = 0; var limited = false;
+             try
+             {
+-                foreach (Match match in rule.Expression.Matches(text))
++                foreach (var match in rule.Expression.EnumerateMatches(text))
+                 {
+                     if (!session.CanContinue()) { limited = true; break; }
+                     if (count == session.Request.Limits.MaxMatchesPerFile) { limited = true; break; }
+--- /dev/null
++++ b/OurDLP/OurDLP.Core/Scanning/ScanThreadPriority.cs
+@@ -0,0 +1,27 @@
++using System.Security;
++
++namespace OurDLP.Core.Scanning;
++
++/// <summary>Only the synchronous file-scan worker is lowered, then restored before thread-pool reuse.</summary>
++internal sealed class ScanThreadPriority : IDisposable
++{
++    private readonly Thread _thread = Thread.CurrentThread;
++    private readonly ThreadPriority _previous;
++    private readonly bool _changed;
++    public ScanThreadPriority()
++    {
++        if (!OperatingSystem.IsWindows()) return;
++        try
++        {
++            _previous = _thread.Priority;
++            if (_previous > ThreadPriority.BelowNormal) { _thread.Priority = ThreadPriority.BelowNormal; _changed = true; }
++        }
++        catch (Exception error) when (error is ThreadStateException or SecurityException or PlatformNotSupportedException or System.ComponentModel.Win32Exception) { }
++    }
++    public void Dispose()
++    {
++        if (!_changed) return;
++        try { _thread.Priority = _previous; }
++        catch (Exception error) when (error is ThreadStateException or SecurityException or PlatformNotSupportedException or System.ComponentModel.Win32Exception) { }
++    }
++}
+--- a/OurDLP/OurDLP.Desktop/OurDLP.Desktop.csproj
++++ b/OurDLP/OurDLP.Desktop/OurDLP.Desktop.csproj
+@@ -6,7 +6,7 @@
+     <Nullable>enable</Nullable>
+     <ImplicitUsings>enable</ImplicitUsings>
+     <UseWPF>true</UseWPF>
+-    <Version>0.9.0</Version>
++    <Version>0.9.1</Version>
+     <ApplicationIcon>Assets/OurDLP.ico</ApplicationIcon>
+   </PropertyGroup>
+ 
+--- a/OurDLP/OurDLP.Desktop/ViewModels/Guidance/TroubleshootingTopics.cs
++++ b/OurDLP/OurDLP.Desktop/ViewModels/Guidance/TroubleshootingTopics.cs
+@@ -8,6 +8,7 @@
+         new("Папка агента есть, а службы нет", "Завершите открытое окно установки клавишей Enter. Используйте актуальный комплект с исправлением восстановления и повторите «Агент на этом ПК». Установщик сохраняет прежнюю папку программы в резервную копию, а регистрацию и очереди не удаляет. Если ошибка повторилась, сохраните её текст и остановитесь до выяснения причины.", "Повторная установка завершена, служба появилась и работает."),
+         new("Код истёк или регистрация отозвана", "Для новой установки выдайте свежий код выбранной записи компьютера. При существующей отозванной регистрации или смене сервера требуется явная перерегистрация. Выдача нового кода отзывает доступ прежнего агента; не делайте это для обычной проверки связи.", "Агент подключён к нужному серверу с актуальной регистрацией.", links.Devices, "Открыть компьютеры"),
+         new("Агент активен, а событий буфера нет", "Откройте назначения буфера и проверьте состояние именно нужного компьютера. Дождитесь подтверждения пользователя, затем скопируйте новый подходящий текст на этом ПК. В журнале очистите поиск. Состояние «Активен» в общем списке подтверждает только связь службы.", "Если обнаружение произошло и доставка работает, в журнале есть событие с нужным временем и компьютером.", links.Assignments, "Проверить назначение"),
+-        new("Файловое задание не завершается", "Проверьте связь агента, выбранный компьютер и путь в разрешённой области его диска. Обновите список заданий, посмотрите состояние, затем откройте отчёт и замечания. Локальная проверка папки и задание на другом ПК выполняются в разных местах.", "Видна причина ожидания, отказа или пропуска. Не делайте вывод об отсутствии чувствительных данных по незавершённой проверке.", links.RemoteFiles, "Проверить задание")
++        new("Файловое задание не завершается", "Проверьте связь агента, выбранный компьютер и путь в разрешённой области его диска. Обновите список заданий, посмотрите состояние, затем откройте отчёт и замечания. Локальная проверка папки и задание на другом ПК выполняются в разных местах.", "Видна причина ожидания, отказа или пропуска. Не делайте вывод об отсутствии чувствительных данных по незавершённой проверке.", links.RemoteFiles, "Проверить задание"),
++        new("Компьютер работает медленно", "В окне запуска нажмите «Замерить ресурсы агента — 60 секунд». Для фонового замера не запускайте проверку файлов. Измеряются только служба агента и компонент буфера на этом ПК; сервер и консоль в эти показатели не входят. После обновления комплекта обновите установленный агент и запустите пользовательский компонент, затем убедитесь в версии агента 0.9.1.", "Окно покажет доступные CPU и память и сохранит CSV/JSON локально. Недоступные счётчики обозначаются явно. Минимальные требования определяются испытанием на реальном слабом ПК, а не размером ZIP.")
+     ]);
+ }
+--- a/OurDLP/OurDLP.Desktop/Views/DevicesView.xaml
++++ b/OurDLP/OurDLP.Desktop/Views/DevicesView.xaml
+@@ -5,8 +5,8 @@
+         <TextBlock Text="Подключайте рабочие места и управляйте регистрацией агентов." Style="{StaticResource MutedText}" Margin="0,7,0,22"/>
+         <Border Style="{StaticResource AdminCard}" Margin="0,0,0,18"><StackPanel>
+             <TextBlock Text="Подключить новый компьютер" Style="{StaticResource SectionTitle}"/>
+-            <TextBlock Text="Укажите понятное название. Одноразовый код появится после добавления." Style="{StaticResource MutedText}" Margin="0,7,0,12"/>
+-            <Label Content="Название компьютера" Target="{Binding ElementName=DeviceNameInput}" Padding="0,0,0,6"/>
++            <TextBlock Text="Например: «Бухгалтерия». Связь с настоящим ПК устанавливается через одноразовый код после установки агента." Style="{StaticResource MutedText}" Margin="0,7,0,12"/>
++            <Label Content="Название в консоли" Target="{Binding ElementName=DeviceNameInput}" Padding="0,0,0,6"/>
+             <DockPanel><Button DockPanel.Dock="Right" Content="Добавить компьютер" Command="{Binding CreateCommand}" Style="{StaticResource PrimaryAction}" Margin="10,0,0,0"/>
+                 <TextBox x:Name="DeviceNameInput" Text="{Binding DeviceName, UpdateSourceTrigger=PropertyChanged}" MaxLength="255" IsEnabled="{Binding CanOperate}" ToolTip="Имя или описание компьютера"/>
+             </DockPanel>
+--- a/OurDLP/OurDLP.Desktop/Views/LoginWindow.xaml
++++ b/OurDLP/OurDLP.Desktop/Views/LoginWindow.xaml
+@@ -15,7 +15,7 @@
+                     <TextBlock Text="Сложная защита.&#10;Простое управление." Foreground="White" FontSize="28" FontWeight="SemiBold" TextWrapping="Wrap" LineHeight="38"/>
+                     <TextBlock Text="Компьютеры, правила и обнаружения — в одном рабочем пространстве." Foreground="{StaticResource SidebarTextBrush}" FontSize="14" TextWrapping="Wrap" Margin="0,18,0,0" LineHeight="23"/>
+                 </StackPanel>
+-                <StackPanel Grid.Row="2"><TextBlock Text="Локальный сервер · Windows" Foreground="{StaticResource SidebarTextBrush}" FontSize="12"/><TextBlock Text="OurDLP 0.9.0 · Режим наблюдения" Foreground="{StaticResource SidebarMutedBrush}" FontSize="11" Margin="0,8,0,0"/></StackPanel>
++                <StackPanel Grid.Row="2"><TextBlock Text="Локальный сервер · Windows" Foreground="{StaticResource SidebarTextBrush}" FontSize="12"/><TextBlock Text="OurDLP 0.9.1 · Режим наблюдения" Foreground="{StaticResource SidebarMutedBrush}" FontSize="11" Margin="0,8,0,0"/></StackPanel>
+             </Grid>
+         </Border>
+         <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+--- a/OurDLP/OurDLP.Desktop/Views/Shell/SidebarView.xaml
++++ b/OurDLP/OurDLP.Desktop/Views/Shell/SidebarView.xaml
+@@ -23,7 +23,7 @@
+                 <Border BorderBrush="#2D4B4E" BorderThickness="0,1,0,0" Padding="0,17,0,0"><StackPanel>
+                     <StackPanel Orientation="Horizontal"><Path Data="{StaticResource IconEye}" Style="{StaticResource LineIcon}" Stroke="#82CFC2" Width="17" Height="17" Margin="0,0,8,0"/><TextBlock Text="Режим наблюдения" Foreground="#E7F4F1" FontSize="12" FontWeight="SemiBold"/></StackPanel>
+                     <TextBlock Text="Копирование и вставка разрешены" Foreground="{StaticResource SidebarMutedBrush}" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,15"/>
+-                    <TextBlock Text="OurDLP 0.9.0 · Windows" Foreground="{StaticResource SidebarMutedBrush}" FontSize="10"/>
++                    <TextBlock Text="OurDLP 0.9.1 · Windows" Foreground="{StaticResource SidebarMutedBrush}" FontSize="10"/>
+                 </StackPanel></Border>
+             </StackPanel>
+         </Grid>
+--- a/OurDLP/OurDLP.Session/OurDLP.Session.csproj
++++ b/OurDLP/OurDLP.Session/OurDLP.Session.csproj
+@@ -1,5 +1,5 @@
+ <Project Sdk="Microsoft.NET.Sdk">
+-  <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
++  <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><Version>0.9.1</Version><ServerGarbageCollection>false</ServerGarbageCollection></PropertyGroup>
+   <ItemGroup><ProjectReference Include="../OurDLP.Contracts/OurDLP.Contracts.csproj" />
+     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.15" />
+   </ItemGroup>
+--- a/OurDLP/OurDLP.Session/SessionCoordinator.cs
++++ b/OurDLP/OurDLP.Session/SessionCoordinator.cs
+@@ -20,9 +20,20 @@
+             $"\nВ очереди: {_state.Pending.Count}. Пропущено: {_state.DroppedCaptures}. Отклонено: {_state.RejectedEvents}.\nСодержимое буфера на сервер не отправляется. Блокировка не выполняется.";
+     }
+     public async Task InitializeAsync(CancellationToken token) => ApplyLocal(await store.ReadAsync(token));
+-    private void ApplyLocal(SessionState state)
++    private CompiledClipboardPolicy? Compile(ClipboardPolicy? definition)
+     {
+-        var policy = state.Policy is null || state.RegistrationKey is null ? null : new SessionPolicy(state.RegistrationKey, new(state.Policy));
++        if (definition is null) return null;
++        var cached = CurrentPolicy?.Compiled;
++        return cached is not null && ClipboardPolicyContent.Same(cached.Definition, definition) ? cached : new(definition);
++    }
++    private void ApplyLocal(SessionState state, CompiledClipboardPolicy? validated = null)
++    {
++        var compiled = state.Policy is null || state.RegistrationKey is null ? null
++            : validated is not null && ClipboardPolicyContent.Same(validated.Definition, state.Policy) ? validated : Compile(state.Policy);
++        var active = CurrentPolicy;
++        var policy = compiled is null ? null
++            : active is not null && active.RegistrationKey == state.RegistrationKey && ReferenceEquals(active.Compiled, compiled) ? active
++            : new SessionPolicy(state.RegistrationKey!, compiled);
+         _state = state; Volatile.Write(ref _policy, policy);
+     }
+     public async Task EnqueueAsync(CapturedClipboard captured, CancellationToken token)
+@@ -48,18 +59,21 @@
+         if (response is null) return;
+         if (response.RegistrationKey is not { Length: 64 } || !response.RegistrationKey.All(Uri.IsHexDigit)
+             || response.Accepted is null || response.Rejected is null) throw new InvalidDataException("Неверный ответ службы.");
+-        if (response.Policy is not null) _ = new CompiledClipboardPolicy(response.Policy);
++        var compiled = Compile(response.Policy);
+         var same = before.RegistrationKey == response.RegistrationKey;
+         var sentIds = sent.Select(row => row.Id).ToHashSet();
+         if (same && response.Accepted.Concat(response.Rejected.Select(row => row.Id)).Any(id => !sentIds.Contains(id)))
+             throw new InvalidDataException("Подтверждение относится к другому пакету.");
+         var done = response.Accepted.Concat(response.Rejected.Select(row => row.Id)).ToHashSet();
++        var rejected = response.Rejected.Select(row => row.Id).ToHashSet();
+         var next = await store.UpdateAsync(current => current.RegistrationKey != before.RegistrationKey && current.RegistrationKey != response.RegistrationKey
+             ? current // Another logon session has already advanced the shared registration cache.
+             : current.RegistrationKey != response.RegistrationKey
+-            ? new() { RegistrationKey = response.RegistrationKey, Policy = response.Policy }
+-            : current with { Policy = response.Policy, Pending = current.Pending.Where(row => !done.Contains(row.Id)).ToArray(),
+-                RejectedEvents = current.RejectedEvents + current.Pending.Count(row => response.Rejected.Any(rejected => rejected.Id == row.Id)) }, token);
+-        ApplyLocal(next);
++            ? new() { RegistrationKey = response.RegistrationKey, Policy = compiled?.Definition }
++            : ClipboardPolicyContent.Same(current.Policy, response.Policy) && !current.Pending.Any(row => done.Contains(row.Id))
++            ? current // Preserve shared-store concurrency checks, but skip encryption and replacement when nothing changed.
++            : current with { Policy = compiled?.Definition, Pending = current.Pending.Where(row => !done.Contains(row.Id)).ToArray(),
++                RejectedEvents = current.RejectedEvents + current.Pending.Count(row => rejected.Contains(row.Id)) }, token);
++        ApplyLocal(next, compiled);
+     }
+ }
+--- a/OurDLP/OurDLP.Session/WindowsSessionStore.cs
++++ b/OurDLP/OurDLP.Session/WindowsSessionStore.cs
+@@ -32,6 +32,7 @@
+             if (update is null) return state;
+             var next = update(state);
+             if (next.SchemaVersion != 1 || next.Pending is null || next.Pending.Count > 128) throw new InvalidDataException();
++            if (ReferenceEquals(next, state)) return state;
+             var plain = JsonSerializer.SerializeToUtf8Bytes(next); byte[] protectedData;
+             try { if (plain.Length > 1024 * 1024) throw new InvalidDataException(); protectedData = ProtectedData.Protect(plain, Entropy, DataProtectionScope.CurrentUser); }
+             finally { CryptographicOperations.ZeroMemory(plain); }
+--- /dev/null
++++ b/OurDLP/OurDLP.Tests/Clipboard/ClipboardIdleTests.cs
+@@ -0,0 +1,140 @@
++using OurDLP.Agent;
++using OurDLP.Agent.Clipboard;
++using OurDLP.Contracts;
++using OurDLP.Core.Clipboard;
++using OurDLP.Session;
++using Xunit;
++
++namespace OurDLP.Tests.Clipboard;
++
++public sealed class ClipboardIdleTests
++{
++    private static T Copy<T>(T value) => value is null ? value : ScanWire.Read<T>(ScanWire.Serialize(value));
++    private static readonly string Key = new('A', 64);
++
++    [Fact]
++    public async Task OneHundredUnchangedUserRepliesReuseThePreparedPolicyAndDoNotRewriteTheStore()
++    {
++        var policy = ClipboardSamples.Policy();
++        var store = new CountingSessionStore { State = new() { RegistrationKey = Key, Policy = policy } };
++        var pipe = new TestSessionClient { Exchange = _ => Task.FromResult<ClipboardSessionResponse?>(new(Key, Copy(policy), [], [], false)) };
++        var session = new SessionCoordinator(store, pipe); await session.InitializeAsync(default);
++        var prepared = session.CurrentPolicy;
++        for (var i = 0; i < 100; i++) await session.SyncOnceAsync(default);
++        Assert.Same(prepared, session.CurrentPolicy); Assert.Equal(100, store.Updates); Assert.Equal(0, store.Writes);
++    }
++
++    [Theory][InlineData(true)][InlineData(false)]
++    public async Task ServicePersistsInitialStateOnceAndDoesNotRewriteIdenticalReplies(bool assigned)
++    {
++        var registration = new MemoryAgentState();
++        await registration.SaveAsync(new() { ServerAddress = "https://localhost", DeviceId = Guid.NewGuid(), Token = new('B', 43) }, default);
++        var store = new CountingAgentStore(); var service = new ClipboardAgentCoordinator(registration, store);
++        var policy = assigned ? ClipboardSamples.Policy() : null;
++        for (var i = 0; i < 100; i++) await service.ApplyAsync(new(Copy(policy), [], []), [], default);
++        Assert.Equal(1, store.Writes); Assert.NotNull(store.State);
++    }
++
++    [Fact]
++    public async Task ChangedContentUnderTheSameIdAndVersionIsAppliedAndInvalidChangesAreRejected()
++    {
++        var policy = ClipboardSamples.Policy();
++        var store = new CountingSessionStore { State = new() { RegistrationKey = Key, Policy = policy } };
++        var response = policy;
++        var session = new SessionCoordinator(store, new TestSessionClient { Exchange = _ => Task.FromResult<ClipboardSessionResponse?>(new(Key, Copy(response), [], [], false)) });
++        await session.InitializeAsync(default); var original = session.CurrentPolicy;
++        response = policy with { Rules = [policy.Rules[0] with { Pattern = "CHANGED" }] };
++        await session.SyncOnceAsync(default);
++        Assert.NotSame(original!.Compiled, session.CurrentPolicy!.Compiled);
++        Assert.Single(session.CurrentPolicy.Compiled.Analyze("CHANGED").Hits); Assert.Equal(1, store.Writes);
++        var lastGood = session.CurrentPolicy;
++        response = response with { Rules = [response.Rules[0] with { Pattern = "(" }] };
++        await Assert.ThrowsAsync<ArgumentException>(() => session.SyncOnceAsync(default));
++        Assert.Same(lastGood, session.CurrentPolicy); Assert.Equal(1, store.Writes);
++    }
++
++    [Fact]
++    public async Task ConcurrentlyPersistedNewEventSurvivesAnUnchangedInFlightReply()
++    {
++        var p = ClipboardSamples.Policy(); var detection = ClipboardSamples.Detection(p);
++        var store = new CountingSessionStore { State = new() { RegistrationKey = Key, Policy = p } };
++        var pipe = new TestSessionClient { Exchange = _ =>
++        {
++            store.State = store.State with { Pending = [detection], DroppedCaptures = 3 };
++            return Task.FromResult<ClipboardSessionResponse?>(new(Key, Copy(p), [], [], false));
++        } };
++        var session = new SessionCoordinator(store, pipe); await session.InitializeAsync(default); await session.SyncOnceAsync(default);
++        Assert.Equal(detection.Id, Assert.Single(store.State.Pending).Id); Assert.Equal(3, store.State.DroppedCaptures);
++        Assert.Equal(0, store.Writes);
++    }
++
++    [Fact]
++    public async Task FailedPolicyWriteDoesNotAdvanceTheAppliedVersion()
++    {
++        var p = ClipboardSamples.Policy(); var next = p with { Version = 2, Enabled = false };
++        var store = new CountingSessionStore { State = new() { RegistrationKey = Key, Policy = p }, FailWrite = true };
++        var session = new SessionCoordinator(store, new TestSessionClient { Exchange = _ => Task.FromResult<ClipboardSessionResponse?>(new(Key, next, [], [], false)) });
++        await session.InitializeAsync(default);
++        await Assert.ThrowsAsync<IOException>(() => session.SyncOnceAsync(default));
++        Assert.Equal(1, session.CurrentPolicy!.Compiled.Definition.Version);
++        store.FailWrite = false; await session.SyncOnceAsync(default);
++        Assert.Equal(2, session.CurrentPolicy!.Compiled.Definition.Version); Assert.False(session.CurrentPolicy.Compiled.Definition.Enabled);
++    }
++
++    [Fact]
++    public async Task DuplicateDurableEventNeedsNoNewWriteButANewEventStillRequiresPersistence()
++    {
++        var registration = new MemoryAgentState();
++        await registration.SaveAsync(new() { ServerAddress = "https://localhost", DeviceId = Guid.NewGuid(), Token = new('B', 43) }, default);
++        var store = new CountingAgentStore(); var service = new ClipboardAgentCoordinator(registration, store);
++        var p = ClipboardSamples.Policy(); await service.ApplyAsync(new(p, [], []), [], default);
++        var detection = ClipboardSamples.Detection(p); var request = ClipboardSamples.Request(store.State!.RegistrationKey, detection);
++        await service.SessionAsync(ClipboardSamples.Peer, request, default); var writes = store.Writes;
++        store.FailWrite = true;
++        var duplicate = await service.SessionAsync(ClipboardSamples.Peer, request, default);
++        Assert.Equal(detection.Id, Assert.Single(duplicate.Accepted)); Assert.Equal(writes, store.Writes);
++        await Assert.ThrowsAsync<IOException>(() => service.SessionAsync(ClipboardSamples.Peer, request with { Events = [detection with { Id = Guid.NewGuid() }] }, default));
++        Assert.Single(store.State.Pending);
++    }
++
++    [Fact]
++    public void PolicyEqualityUsesAllFieldsAndOrderedRulesRatherThanOnlyIdsAndVersions()
++    {
++        var p = ClipboardSamples.Policy() with { Rules = [ClipboardSamples.Policy().Rules[0], ClipboardSamples.Policy().Rules[0]] };
++        Assert.True(ClipboardPolicyContent.Same(p, Copy(p)));
++        foreach (var changed in new[] { p with { Id = Guid.NewGuid() }, p with { Version = 2 }, p with { Name = "other" },
++            p with { Enabled = false }, p with { MaxTextCharacters = 4096 }, p with { Rules = p.Rules.Reverse().ToArray() },
++            p with { Rules = [p.Rules[0] with { Name = "other" }, p.Rules[1]] }, p with { Rules = [p.Rules[0] with { Pattern = "other" }, p.Rules[1]] } })
++            Assert.False(ClipboardPolicyContent.Same(p, changed));
++        Assert.False(ClipboardPolicyContent.Same(p, null)); Assert.True(ClipboardPolicyContent.Same(null, null));
++    }
++
++    private sealed class CountingSessionStore : ISessionStateStore
++    {
++        public SessionState State { get; set; } = new();
++        public int Writes { get; private set; }
++        public int Updates { get; private set; }
++        public bool FailWrite { get; set; }
++        public Task<SessionState> ReadAsync(CancellationToken token) => Task.FromResult(Copy(State));
++        public Task<SessionState> UpdateAsync(Func<SessionState, SessionState> update, CancellationToken token)
++        {
++            Updates++; var current = Copy(State); var next = update(current);
++            if (!ReferenceEquals(current, next))
++            {
++                if (FailWrite) throw new IOException("Fixture write unavailable");
++                Writes++; State = Copy(next);
++            }
++            return Task.FromResult(Copy(State));
++        }
++    }
++    private sealed class CountingAgentStore : IClipboardAgentStore
++    {
++        public ClipboardAgentState? State { get; private set; }
++        public int Writes { get; private set; }
++        public bool FailWrite { get; set; }
++        public Task<ClipboardAgentState?> ReadAsync(CancellationToken token) => Task.FromResult(Copy(State));
++        public Task SaveAsync(ClipboardAgentState value, CancellationToken token)
++        { if (FailWrite) throw new IOException("Fixture write unavailable"); Writes++; State = Copy(value); return Task.CompletedTask; }
++        public Task ArchiveAsync(CancellationToken token) { State = null; return Task.CompletedTask; }
++    }
++}
+--- a/OurDLP/OurDLP.Tests/Scanning/FileScannerTests.cs
++++ b/OurDLP/OurDLP.Tests/Scanning/FileScannerTests.cs
+@@ -9,6 +9,18 @@
+ 
+ public sealed class FileScannerTests
+ {
++    [Theory]
++    [InlineData("(?=a)", "aaaa", 4)]
++    [InlineData(@"\b(a+)\s+\1\b", "aa aa aaa aaa", 2)]
++    [InlineData(@"\p{L}+", "Ёж ёлка A", 3)]
++    [InlineData(".*?", "ab", 3)]
++    public async Task CountsZeroWidthUnicodeAndBackreferenceMatchesWithoutMaterializingMatchObjects(string pattern, string text, int expected)
++    {
++        using var files = new ScanFiles(); files.Write("input.txt", text);
++        var report = await new FileScanner().ScanAsync(files.Request(pattern), null, default);
++        Assert.Equal(ScanCompletion.Completed, report.Completion); Assert.Empty(report.Issues);
++        Assert.Equal(expected, Assert.Single(report.Findings).Matches);
++    }
+     [Fact]
+     public async Task DemoFindsSevenMarkersInFourFilesWithoutChangingSourceOrRecordingValues()
+     {
+--- /dev/null
++++ b/OurDLP/OurDLP.Tests/SetupScripts/Verify-ResourceSamples.ps1
+@@ -0,0 +1,39 @@
++#Requires -Version 5.1
++[CmdletBinding()]
++param([string]$SourceRoot=(Split-Path (Split-Path $PSScriptRoot -Parent) -Parent))
++Set-StrictMode -Version Latest
++$ErrorActionPreference='Stop'
++. (Join-Path $SourceRoot 'tools/ResourceSamples.ps1')
++$passed=0
++function Check([bool]$Value,[string]$Name){if(-not $Value){throw ('FAIL '+$Name)};$script:passed++;Write-Host ('PASS '+$Name)}
++Check ((Get-OurDlpCpuPercent 1 1.08 1 8) -eq 1) 'CPU is normalized to all logical processors'
++Check ($null -eq (Get-OurDlpCpuPercent $null 1 1 2)) 'First sample has no invented zero CPU'
++Check ($null -eq (Get-OurDlpCpuPercent 2 1 1 2)) 'Reset CPU counter is not a negative usage'
++Check ($null -eq (Get-OurDlpCpuPercent 1 2 0 2)) 'Zero elapsed time is rejected'
++$rows=@(
++ [pscustomobject]@{Sample=0;Process='Agent';WorkingSetMiB=12;PrivateMiB=8;CpuPercent=$null;Status='ok'},
++ [pscustomobject]@{Sample=0;Process='Session';WorkingSetMiB=20;PrivateMiB=14;CpuPercent=$null;Status='ok'},
++ [pscustomobject]@{Sample=1;Process='Agent';WorkingSetMiB=13;PrivateMiB=9;CpuPercent=0.2;Status='ok'},
++ [pscustomobject]@{Sample=1;Process='Session';WorkingSetMiB=21;PrivateMiB=15;CpuPercent=0.3;Status='ok'},
++ [pscustomobject]@{Sample=2;Process='Agent';WorkingSetMiB=$null;PrivateMiB=$null;CpuPercent=$null;Status='not-running'},
++ [pscustomobject]@{Sample=2;Process='Session';WorkingSetMiB=22;PrivateMiB=16;CpuPercent=0.1;Status='ok'}
++)
++$summary=Get-OurDlpResourceSummary $rows 2
++Check ($summary.CompleteMemorySamples -eq 2 -and $summary.MaxWorkingSetSumMiB -eq 34 -and $summary.AverageCpuPercent -eq 0.5) 'Only complete samples enter endpoint aggregates'
++$partial=@($rows[0],($rows[1]|Select-Object *));$partial[1].Status='partial-metrics'
++Check ((Get-OurDlpResourceSummary $partial 2).CompleteMemorySamples -eq 1) 'Readable memory remains valid when CPU access is unavailable'
++$missing=@(Get-OurDlpResourceRows @('OurDLP.NoSuchFixtureProcess') @{} 0 0)
++Check ($missing.Count -eq 1 -and $missing[0].Status -eq 'not-running' -and $null -eq $missing[0].WorkingSetMiB) 'Missing process is unavailable rather than zero memory'
++$realName=(Get-Process -Id $PID).ProcessName;$previous=@{}
++$one=@(Get-OurDlpResourceRows @($realName) $previous 0 0)
++$two=@(Get-OurDlpResourceRows @($realName) $previous 1 1)
++Check ($one.Count -gt 0 -and @($two|Where-Object{$_.Pid -eq $PID -and $null -ne $_.WorkingSetMiB}).Count -eq 1) 'Actual portable process counters can be sampled without Windows GUI'
++$fixture=Join-Path ([IO.Path]::GetTempPath()) ('ourdlp-resource-check-'+[Guid]::NewGuid().ToString('N'))
++try{
++ $report=Save-OurDlpResourceReport $missing $fixture 'idle' 1 1 $true
++ $json=Get-Content -LiteralPath $report.Json -Raw -Encoding UTF8|ConvertFrom-Json
++ Check ($json.Summary.CompleteMemorySamples -eq 0 -and $null -eq $json.Summary.MaxWorkingSetSumMiB) 'Missing counters remain null in serialized report'
++ $text=Get-Content -LiteralPath $report.Csv -Raw -Encoding UTF8
++ Check ($text -notmatch 'CommandLine|UserName|MachineName|Password|ClipboardText') 'Report contains only process resource fields'
++}finally{if(Test-Path -LiteralPath $fixture){Remove-Item -LiteralPath $fixture -Recurse -Force}}
++Write-Host ('RESULT '+$passed+' resource sampler checks passed; no native WinForms or service measurement claimed.')
+--- /dev/null
++++ b/OurDLP/PERFORMANCE.md
+@@ -0,0 +1,34 @@
++# OurDLP 0.9.1 — нагрузка на рабочий ПК
++
++## Требование проекта
++
++Рабочий ПК должен сохранять отзывчивость при фоновой работе агента. Консоль, сервер и PostgreSQL могут находиться на отдельном администраторском ПК; пользовательскому компьютеру нужны служба Agent и компонент Session. Целевая платформа остаётся Windows 10/11 x64.
++
++Поддержка «любого компьютера», минимальная RAM и гарантированный процент CPU пока не подтверждены. Они определяются на реальном слабом Windows-ПК. Размер ZIP со встроенным .NET не является потреблением памяти. При демонстрации всех компонентов на одном ПК их нагрузка складывается; замер агента не равен общему потреблению демонстрации.
++
++## Изменения
++
++- Подготовленные правила буфера повторно используются при полностью одинаковом содержимом политики. Сравниваются все поля и упорядоченные правила, а не только ID/версия. Кэш ограничен одной текущей политикой; смена, выключение и снятие продолжают применяться. Изменённая политика проходит прежнюю валидацию.
++- Пользовательское хранилище по-прежнему читает актуальное защищённое состояние под межсеансовой блокировкой. При отсутствии изменений callback возвращает этот же объект, поэтому пропускаются повторное шифрование, временный файл и замена state.bin. Чтение/проверки защиты и слияние новых событий сохраняются.
++- Служба не перезаписывает неизменную политику и очередь при каждом обмене. Новое состояние сохраняется минимум один раз. Для нового события надёжная запись предшествует подтверждению; повтор уже сохранённого события подтверждается без ещё одной записи. При ошибке сохранения новое событие не подтверждается.
++- В файловом сканере подсчёт переведён на Regex.EnumerateMatches. Не материализуются пользовательские Match/Group-объекты для каждого найденного совпадения. Сохранены лимиты, тайм-ауты, отметки неполного результата и отмена. На Windows синхронный поток файловой проверки получает BelowNormal и восстанавливает прежний приоритет до возврата в пул; при недоступности настройки остаётся обычный приоритет.
++- Для Agent/Session явно закреплён Workstation GC. Для этих консольных проектов он и ранее был стандартным выбором SDK; это фиксация профиля, а не самостоятельное доказательство уменьшения RAM.
++
++Периоды связи не увеличены: heartbeat примерно 30 секунд, серверная политика 15 секунд, локальный обмен Session 5 секунд. Нет принудительного GC/урезания рабочего набора, отключения правил, ослабления DPAPI/ACL/TLS, новых фоновых полных проверок диска или изменения формата очередей. BelowNormal не является жёстким ограничителем CPU: активная проверка всё ещё может заметно нагружать процессор и диск.
++
++## Как замерить на Windows
++
++1. Обновить комплект, запустить сервер и выполнить «Агент на этом ПК» для обновления установленной службы. Открыть пользовательский компонент. В консоли дождаться версии агента **0.9.1** и нужного состояния наблюдения.
++2. Дать процессам завершить старт. В окне запуска нажать **«Замерить ресурсы агента — 60 секунд»**. Для фонового замера не запускать проверку файлов.
++3. Окно показывает CPU и память и сохраняет CSV/JSON в `%LOCALAPPDATA%/OurDLP/ResourceReports`. Одинаковый замер не запускается вторым окном из того же launcher.
++4. Для сравнения копирования и сканирования можно использовать tools/Measure-Resources.ps1 с параметром Scenario clipboard или scan. Запускать на проверяемом ПК, не на другом администраторском компьютере. Скрипт читает счётчики и создаёт отчёт, не меняя настройки защиты.
++
++CPU вычисляется из разницы TotalProcessorTime, фактического интервала монотонных часов и числа логических процессоров. Первый интервал без предыдущего счётчика остаётся пустым. Смена PID/времени старта сбрасывает базу. Рабочий набор и частная память показываются отдельно; сумма рабочих наборов может повторно учитывать общие страницы. Полные итоговые показатели рассчитываются только для полного доступного набора процессов. Недоступные/отсутствующие процессы не считаются нулевым потреблением.
++
++По умолчанию учитываются OurDLP.Agent и OurDLP.Session, все найденные экземпляры. PowerShell/окно замера, WPF-консоль, PostgreSQL и сервер в эти числа не входят, хотя сам сборщик тоже создаёт небольшую нагрузку. Отчёт не содержит имён пользователей/ПК, командных строк, токенов, текста буфера или содержимого файлов. Автоматической отправки отчёта нет.
++
++## Подтверждение изменений
++
++Переносимые проверки включают 100 последовательных неизменных ответов: пользовательское хранилище не получает запросов на новую запись, а подготовленный объект политики сохраняется. У службы начальное состояние сохраняется один раз, дальнейшие одинаковые ответы не создают записи. Проверены смена содержимого при том же ID/версии, отказ записи, конкурентное появление события, повтор подтверждённого события, пределы совпадений, Unicode, backreference и совпадения нулевой длины.
++
++Это доказательство поведения кода. DPAPI, изменение приоритета потока и настоящие Agent/Session на Windows здесь не исполнялись, поэтому ни конкретная RAM, ни экономия в процентах CPU, ни минимальное железо этим документом не заявлены. Нативный замер также должен включать отзывчивость при обычной работе пользователя и при файловом задании.
+--- a/OurDLP/README.md
++++ b/OurDLP/README.md
+@@ -1,28 +1,23 @@
+-# OurDLP 0.9.0 — новый интерфейс консоли
++# OurDLP 0.9.1 — снижение лишней фоновой работы
+ 
+-Готовая программа — **OurDLP-design-win-x64.zip**, исходники Visual Studio — **OurDLP-design-source.zip**. Полностью распакуйте архив и откройте **ЗАПУСТИТЬ.cmd обычным пользователем Windows**. .NET включён; нужен установленный и работающий PostgreSQL 17. Для разработки откройте OurDLP.slnx в Visual Studio 2026 / .NET 10.
++Готовая программа Windows x64 — **OurDLP-light-win-x64.zip**, исходники Visual Studio — **OurDLP-light-source.zip**, небольшое обновление прежнего демонстрационного комплекта — **OurDLP-light-update.zip**. .NET включён; для сервера нужен запущенный PostgreSQL 17. Для разработки открыть OurDLP.slnx в Visual Studio 2026 / .NET 10.
+ 
+-## Новый дизайн
++## Новое
+ 
+-- Тёмная боковая навигация, светлая рабочая область, фирменный бирюзовый акцент и собственные векторные иконки.
+-- Главная страница со сводкой по буферу обмена, последними загруженными событиями и быстрыми переходами. Показатели берутся из настоящего API. До первой загрузки показывается «—», при ошибке обновления явно обозначены последние полученные сведения.
+-- Единые кнопки, поля ввода, списки, вкладки и таблицы; различимые состояния выбора, фокуса и недоступных действий. Статусы подписаны словами, а не только цветом.
+-- Подключение нового ПК отделено от управления выбранной регистрацией. Отзыв доступа выделен красным; прежние подтверждения действий сохранены.
+-- Новое окно входа, адаптивные карточки, сворачивание декоративной панели входа в узком окне, ограничение начального размера окна рабочей областью экрана.
+-- Сохранены русская помощь, F1, пошаговая инструкция и тестовый текст. Окно запуска также оформлено в общей палитре и использует фирменную иконку.
++Подготовленные правила буфера переиспользуются, неизменное защищённое состояние не перезаписывается при каждом обмене, повтор уже сохранённого события не требует ещё одной записи. Файловый подсчёт создаёт меньше временных объектов, на Windows снижается приоритет именно синхронного потока сканирования с восстановлением прежнего приоритета. Новые события по-прежнему подтверждаются после надёжного сохранения; защита хранилищ и частота связи сохранены.
+ 
+-Технические детали и нативная приёмка — [DESIGN.md](DESIGN.md). Встроенная инструкция — «Помощь» или F1, дополнительная памятка — GUIDE.md.
++В окне запуска появилась кнопка **«Замерить ресурсы агента — 60 секунд»**. CPU и память измеряются на этом ПК для Agent/Session; итог показывается в окне и сохраняется локально в CSV/JSON. Недоступные счётчики помечаются явно. Инструкция есть в помощи. Поле регистрации уточнено до «Название в консоли»: связь с настоящим компьютером устанавливается кодом.
+ 
+ ## Обновление
+ 
+-В **прежнем окне запуска** остановите свой сервер специальной кнопкой, затем закройте консоль и окно запуска. Службу агента для обновления интерфейса останавливать не требуется. Распакуйте полный новый комплект в новую папку либо **OurDLP-design-update.zip** прямо в существующую папку демонстрационного комплекта 0.8.2/0.8.3 рядом с ЗАПУСТИТЬ.cmd, подтвердив замену. Затем запустите комплект снова.
++1. В прежнем окне запуска остановить свой сервер, закрыть консоль и launcher.
++2. Распаковать полный комплект в новую папку либо маленькое обновление прямо рядом с ЗАПУСТИТЬ.cmd старого комплекта 0.8.2/0.8.3/0.9.0 с заменой файлов.
++3. Открыть ЗАПУСТИТЬ.cmd обычным пользователем, запустить сервер, затем **«Агент на этом ПК: установить или обновить»**. В этом выпуске изменены Agent и Session: одной замены файлов комплекта недостаточно для установленной службы.
++4. Снова открыть компонент буфера и дождаться версии агента **0.9.1** в консоли. Регистрация и защищённые очереди сохраняются. Новая первичная настройка/миграция базы не нужна.
++5. Нажать кнопку замера. Для фонового измерения не запускать проверку файлов.
+ 
+-База, настройки, учётная запись и регистрация агента сохраняются; повторная первичная настройка не нужна, если всё уже готово. Комплект использует существующую локальную базу OurDLP. Новых миграций относительно 0.8 нет. Исправление восстановления установки из предыдущего выпуска включено. Сервер и агентские компоненты в готовом архиве повторно использованы побайтно из исправленного 0.8.2; версия новой консоли и комплекта — 0.9.0.
++Выпуск сохраняет дизайн 0.9.0, русскую помощь и F1. Режим — наблюдение; копирование/вставка разрешены, блокировки USB/печати/сетевых передач пока нет. API и форматы очередей не изменены, готовый сервер повторно используется из прежнего комплекта.
+ 
+-## Границы
++214 проверок логики/файлов/PostgreSQL и 24 live-HTTPS, всего **238 выполнений без ошибок и пропусков**; отдельно 14+12+10 переносимых проверок скриптов. Нативные DPAPI/ACL/SCM/WinForms/WPF/приоритет потока и потребление настоящего агента на Windows не измерены. Минимальные требования и конкретные проценты экономии не объявляются подтверждёнными. Подробности — PERFORMANCE.md и VALIDATION.md.
+ 
+-Режим остаётся наблюдением: копирование и вставка разрешены, содержимое буфера на сервер не передаётся. Блокировка USB, печати и сетевых передач пока не реализована. Сводка относится к полученным данным раздела буфера; число загруженных событий не является числом всех утечек или всех событий за всю историю. Новые диаграммы с выдуманной статистикой и подставные обнаружения не добавлены.
+-
+-Сборка Release и self-contained публикация Windows x64 выполнены без ошибок/предупреждений. Пройдены 202 проверки логики/файлов/настоящего PostgreSQL, 14 переносимых проверок запуска и 12 проверок установки; разобраны 24 PowerShell-файла. Подробности и пределы — VALIDATION.md. Реальный WPF/WinForms, масштабирование, всплывающие списки, клавиатуру, UAC/SCM/DPAPI и захват буфера нужно проверить на Windows. Изображения предпросмотра компоновки являются реконструкциями с условными данными; они не служат протоколом нативного испытания.
+-
+-Повторная сборка Windows-комплекта: `tools/Publish-Demo.ps1 -OutputPath "D:/OurDLP-Demo"`. Исходный OpenDLP и master сохранены.
++Слабые рабочие ПК являются приоритетом проекта; сервер, базу и администраторский интерфейс можно держать отдельно. Исходный OpenDLP и master сохранены. Повторная сборка комплекта: tools/Publish-Demo.ps1.
+--- a/OurDLP/VALIDATION.md
++++ b/OurDLP/VALIDATION.md
+@@ -1,3 +1,15 @@
++# Проверка оптимизации 0.9.1 — 26.11.2026
++
++- 214 проверок логики/файлов/реального PostgreSQL и 24 выполнения live-HTTPS (готовая БД, отсутствие конфигурации, недоверенный сертификат, несовпадение имени): 238, без ошибок/пропусков. Целевые промежуточные прогоны в итог повторно не добавляются.
++- 12 новых выполнений проверяют отсутствие лишних записей, повторное использование правил, изменённое содержимое, отказ сохранения и конкурирующее событие, а также Unicode/backreference/совпадения нулевой длины сканера. Сохраняются прежние проверки лимитов/тайм-аутов/отмены/очередей/регистрации.
++- Публикация Agent, Session и Desktop self-contained Windows x64 без предупреждений/ошибок. Для Agent/Session runtimeconfig явно содержит System.GC.Server=false.
++- 14 переносимых проверок запуска, 12 восстановления установки, 10 сборщика ресурсов пройдены; полный CLI сборщика выполнен над настоящим процессом PowerShell в Linux и корректно пометил платформу как переносимый тест. Эти числа не являются замером Windows-агента.
++- Проверен синтаксис 28 PowerShell-файлов. Окна WinForms/WPF, Windows PowerShell 5.1, SCM/DPAPI/ACL и снижение приоритета Windows-потока здесь не исполнялись.
++- Для HTTPS-проверок создан новый краткоживущий изолированный localhost-сертификат: прежний тестовый истёк 25.11.2026. Проверка сертификата продукта не отключалась. Ключи и настройки тестовой БД не включаются в поставку.
++- Минимальные требования к железу, конкретная RAM/CPU и снижение затрат в процентах пока не измерены на Windows. Процедура — PERFORMANCE.md. Ниже сохранены исторические протоколы.
++
++---
++
+ # Проверки интерфейса 0.9.0 — 26.11.2026
+ 
+ - Release решения и публикация консоли self-contained Windows x64: без ошибок и предупреждений.
+--- a/OurDLP/demo/launcher/DemoAppearance.ps1
++++ b/OurDLP/demo/launcher/DemoAppearance.ps1
+@@ -8,7 +8,7 @@
+     $brand=[Windows.Forms.Panel]::new();$brand.Dock='Left';$brand.Width=200;$brand.BackColor=[Drawing.ColorTranslator]::FromHtml('#0D292D')
+     $name=[Windows.Forms.Label]::new();$name.Text='OurDLP';$name.ForeColor=[Drawing.Color]::White;$name.Font=[Drawing.Font]::new('Segoe UI',25,[Drawing.FontStyle]::Bold);$name.SetBounds(22,36,170,52)
+     $tagline=[Windows.Forms.Label]::new();$tagline.Text="Сложная защита.`r`nПростое управление.";$tagline.ForeColor=[Drawing.ColorTranslator]::FromHtml('#BDCFD1');$tagline.SetBounds(24,96,155,56)
+-    $mode=[Windows.Forms.Label]::new();$mode.Text="РЕЖИМ НАБЛЮДЕНИЯ`r`n`r`nКопирование и вставка разрешены.`r`n`r`nOurDLP 0.9.0";$mode.ForeColor=[Drawing.ColorTranslator]::FromHtml('#9AB8BB');$mode.Dock='Bottom';$mode.Height=158;$mode.Padding=[Windows.Forms.Padding]::new(24,12,18,0)
++    $mode=[Windows.Forms.Label]::new();$mode.Text="РЕЖИМ НАБЛЮДЕНИЯ`r`n`r`nКопирование и вставка разрешены.`r`n`r`nOurDLP 0.9.1";$mode.ForeColor=[Drawing.ColorTranslator]::FromHtml('#9AB8BB');$mode.Dock='Bottom';$mode.Height=158;$mode.Padding=[Windows.Forms.Padding]::new(24,12,18,0)
+     $brand.Controls.AddRange(@($name,$tagline,$mode))
+     $panel=[Windows.Forms.FlowLayoutPanel]::new();$panel.Dock='Fill';$panel.Padding=[Windows.Forms.Padding]::new(28,24,28,24)
+     $panel.FlowDirection='TopDown';$panel.WrapContents=$false;$panel.AutoScroll=$true;$panel.ForeColor=[Drawing.ColorTranslator]::FromHtml('#172E32')
+--- a/OurDLP/demo/launcher/DemoHelp.ps1
++++ b/OurDLP/demo/launcher/DemoHelp.ps1
+@@ -49,6 +49,8 @@
+ 
+ На втором ПК localhost указывает на него самого. Используйте адрес вашего сервера, соответствующий его доверенному сертификату. Первый показ можно полностью выполнить на одном ПК.
+ 
++Для замера нагрузки нажмите «Замерить ресурсы агента — 60 секунд». Сначала обновите агент кнопкой «Агент на этом ПК» и откройте компонент буфера. В фоновом замере не запускайте проверку файлов. Окно измеряет только два компонента на этом ПК и сохраняет CSV/JSON локально; отсутствующие значения не считаются нулевыми.
++
+ Подробности и объяснение состояний доступны внутри консоли: «Помощь» или F1. Кнопка диагностики открывает журналы. Не передавайте пароли, одноразовые коды или локальные файлы регистрации.
+ '@}
+     )
+--- /dev/null
++++ b/OurDLP/demo/launcher/Measure-DemoResources.ps1
+@@ -0,0 +1,52 @@
++#Requires -Version 5.1
++Add-Type -AssemblyName System.Windows.Forms
++Add-Type -AssemblyName System.Drawing
++[Windows.Forms.Application]::EnableVisualStyles()
++$ErrorActionPreference='Stop'
++. (Join-Path (Split-Path $PSScriptRoot -Parent) 'tools/ResourceSamples.ps1')
++$directory=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'OurDLP/ResourceReports'
++$form=[Windows.Forms.Form]::new();$form.Text='OurDLP — Замер ресурсов агента';$form.Size=[Drawing.Size]::new(740,540);$form.MinimumSize=[Drawing.Size]::new(650,480)
++$form.StartPosition='CenterScreen';$form.Font=[Drawing.Font]::new('Segoe UI',11);$form.AutoScaleMode='Dpi';$form.BackColor=[Drawing.ColorTranslator]::FromHtml('#F2F5F5')
++$layout=[Windows.Forms.TableLayoutPanel]::new();$layout.Dock='Fill';$layout.Padding=[Windows.Forms.Padding]::new(24);$layout.ColumnCount=1;$layout.RowCount=4
++$layout.RowStyles.Add([Windows.Forms.RowStyle]::new('AutoSize'))|Out-Null;$layout.RowStyles.Add([Windows.Forms.RowStyle]::new('AutoSize'))|Out-Null;$layout.RowStyles.Add([Windows.Forms.RowStyle]::new('Percent',100))|Out-Null;$layout.RowStyles.Add([Windows.Forms.RowStyle]::new('AutoSize'))|Out-Null;$form.Controls.Add($layout)
++$intro=[Windows.Forms.Label]::new();$intro.AutoSize=$true;$intro.MaximumSize=[Drawing.Size]::new(650,0);$intro.Text="Измеряется только агент и компонент буфера на этом ПК в течение 60 секунд. Для замера в покое не запускайте проверку файлов. Сервер и это окно в показатели не входят.";$intro.Margin=[Windows.Forms.Padding]::new(0,0,0,16);$layout.Controls.Add($intro,0,0)
++$progress=[Windows.Forms.ProgressBar]::new();$progress.Dock='Top';$progress.Maximum=60;$progress.Height=12;$layout.Controls.Add($progress,0,1)
++$output=[Windows.Forms.TextBox]::new();$output.Multiline=$true;$output.ReadOnly=$true;$output.Dock='Fill';$output.ScrollBars='Vertical';$output.BorderStyle='None';$output.BackColor=$form.BackColor;$output.Margin=[Windows.Forms.Padding]::new(0,18,0,18);$layout.Controls.Add($output,0,2)
++$buttons=[Windows.Forms.FlowLayoutPanel]::new();$buttons.AutoSize=$true;$buttons.Dock='Fill';$layout.Controls.Add($buttons,0,3)
++$restart=[Windows.Forms.Button]::new();$restart.Text='Повторить замер';$restart.AutoSize=$true;$restart.Enabled=$false;$restart.Padding=[Windows.Forms.Padding]::new(12,6,12,6);$buttons.Controls.Add($restart)
++$folder=[Windows.Forms.Button]::new();$folder.Text='Папка отчётов';$folder.AutoSize=$true;$folder.Enabled=$false;$folder.Padding=[Windows.Forms.Padding]::new(12,6,12,6);$buttons.Controls.Add($folder)
++$folder.Add_Click({Start-Process explorer.exe -ArgumentList ('"'+$directory+'"')|Out-Null})
++$timer=[Windows.Forms.Timer]::new();$timer.Interval=1000
++$script:ResourceRows=[Collections.Generic.List[object]]::new();$script:ResourcePrevious=@{};$script:ResourceClock=[Diagnostics.Stopwatch]::new();$script:ResourceSample=0;$script:ResourceRunning=$false
++function Resource-Status([string]$Status){switch($Status){'ok'{'измеряется'}'not-running'{'не запущен'}'partial-metrics'{'часть счётчиков недоступна'}'process-ended'{'процесс завершился'}default{'счётчики недоступны'}}}
++function Resource-Value($Value,[string]$Suffix){if($null -eq $Value){return 'нет доступных данных'};return ([string]$Value+$Suffix)}
++function Finish-ResourceMeasurement([bool]$Completed){
++    $timer.Stop();$script:ResourceRunning=$false;$script:ResourceClock.Stop()
++    try{
++        $report=Save-OurDlpResourceReport $script:ResourceRows.ToArray() $directory 'idle' $script:ResourceClock.Elapsed.TotalSeconds 2 $Completed
++        $summary=$report.Summary
++        $output.Text="Замер завершён. Полных измерений памяти: $($summary.CompleteMemorySamples).`r`n`r`n"+
++            'Максимальная сумма рабочих наборов: '+(Resource-Value $summary.MaxWorkingSetSumMiB ' МиБ')+"`r`n"+
++            'Максимальная частная память: '+(Resource-Value $summary.MaxPrivateSumMiB ' МиБ')+"`r`n"+
++            'Средний CPU: '+(Resource-Value $summary.AverageCpuPercent ' %')+"`r`n`r`n"+
++            "Сумма рабочих наборов может повторно учитывать общие страницы.`r`nЕсли процесс не запущен или доступ к счётчикам закрыт, показатель считается недоступным, а не нулевым.`r`n`r`nCSV и JSON сохранены в папке отчётов. Это результат данного ПК и сценария, не гарантия для всех компьютеров."
++        $folder.Enabled=$true
++    }catch{$output.Text='Не удалось сохранить отчёт: '+$_.Exception.Message}
++    $restart.Enabled=$true
++}
++function Sample-ResourceMeasurement{
++    try{
++        $batch=@(Get-OurDlpResourceRows @('OurDLP.Agent','OurDLP.Session') $script:ResourcePrevious $script:ResourceClock.Elapsed.TotalSeconds $script:ResourceSample)
++        foreach($row in $batch){$script:ResourceRows.Add($row)};$script:ResourceSample++
++        $progress.Value=[Math]::Min(60,[int]$script:ResourceClock.Elapsed.TotalSeconds)
++        $output.Text='Измерение: '+$progress.Value+" / 60 секунд.`r`n`r`n"+($batch|ForEach-Object{$_.Process+': '+(Resource-Status $_.Status)+'; память '+(Resource-Value $_.WorkingSetMiB ' МиБ')+'; CPU '+(Resource-Value $_.CpuPercent ' %')}|Out-String)
++        if($script:ResourceClock.Elapsed.TotalSeconds -ge 60){Finish-ResourceMeasurement $true}
++    }catch{$timer.Stop();$script:ResourceRunning=$false;$output.Text='Замер не завершён: '+$_.Exception.Message;$restart.Enabled=$true}
++}
++function Start-ResourceMeasurement{
++    $restart.Enabled=$false;$folder.Enabled=$false;$progress.Value=0;$script:ResourceRows.Clear();$script:ResourcePrevious=@{};$script:ResourceSample=0;$script:ResourceClock.Restart();$script:ResourceRunning=$true
++    Sample-ResourceMeasurement;if($script:ResourceRunning){$timer.Start()}
++}
++$timer.Add_Tick({Sample-ResourceMeasurement});$restart.Add_Click({Start-ResourceMeasurement});$form.Add_Shown({Start-ResourceMeasurement})
++$form.Add_FormClosing({if($script:ResourceRunning){Finish-ResourceMeasurement $false}})
++try{[Windows.Forms.Application]::Run($form)}finally{$timer.Dispose();$form.Dispose()}
+--- a/OurDLP/demo/launcher/Start-Demo.ps1
++++ b/OurDLP/demo/launcher/Start-Demo.ps1
+@@ -24,7 +24,7 @@
+     $null=Add-DemoLabel 'OurDLP — показ на одном Windows-ПК' 42 19
+     $null=Add-DemoLabel 'Один комплект: сервер, консоль, агент и тестовые материалы. .NET включён. PostgreSQL должен быть установлен и запущен. Перед запуском закройте прежний сервер в Visual Studio.' 70 10
+     $status=Add-DemoLabel 'Начните с проверки готовности. Если база и сертификат уже настроены, первичную подготовку можно пропустить.' 66 10
+-    $script:DemoBusy=$false;$script:DemoButtons=@();$script:DemoChildProcess=$null
++    $script:DemoBusy=$false;$script:DemoButtons=@();$script:DemoChildProcess=$null;$script:ResourceMeasurementProcess=$null
+     function Run-DemoAction([scriptblock]$Action){
+         if($script:DemoBusy){return};$script:DemoBusy=$true;foreach($b in $script:DemoButtons){$b.Enabled=$false};$status.Text='Выполняется действие…';$form.Refresh()
+         try{$status.ForeColor=[Drawing.ColorTranslator]::FromHtml('#172E32');& $Action}catch{$status.ForeColor=[Drawing.ColorTranslator]::FromHtml('#A33132');$status.Text=$_.Exception.Message}
+@@ -56,6 +56,13 @@
+     }
+     Add-DemoButton 'Инструкция и помощь — прямо в программе (F1)' {Show-DemoGuide $form;$status.Text='После входа в консоль подробная инструкция доступна в разделе «Помощь» и по F1.'}
+     Add-DemoButton 'Остановить мой сервер для проверки офлайн' {Stop-OwnedDemoServer;$status.Text='Сервер этого комплекта остановлен. Служба и пользовательский компонент продолжают работу. Скопируйте второй маркер, затем снова запустите сервер.'}
++    Add-DemoButton 'Замерить ресурсы агента — 60 секунд' {
++        if($null -ne $script:ResourceMeasurementProcess -and -not $script:ResourceMeasurementProcess.HasExited){$status.Text='Окно замера уже открыто. Завершите текущий замер или закройте его.';return}
++        if($null -ne $script:ResourceMeasurementProcess){$script:ResourceMeasurementProcess.Dispose()}
++        $file=Join-Path $PSScriptRoot 'Measure-DemoResources.ps1'
++        $script:ResourceMeasurementProcess=Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -PassThru -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$file+'"'))
++        $status.Text='Открылось окно замера CPU и памяти агента на этом ПК. Для фонового замера не запускайте проверку файлов. Отчёт сохранится локально; отсутствующие счётчики обозначаются как недоступные.'
++    }
+     Add-DemoButton 'Диагностика: открыть папку журналов' {Start-Process explorer.exe -ArgumentList ('"'+$script:DemoData+'"')|Out-Null;$status.Text='Журналы сервера находятся в открывшейся папке. Не отправляйте пароли и файлы User Secrets.'}
+     $null=Add-DemoLabel 'Режим наблюдения: копирование и вставка разрешены. Содержимое буфера не сохраняется. Закрытие этого окна оставляет сервер и агент работающими.' 56 10
+     $form.Add_FormClosing({param($sender,$eventArgs) if($script:DemoBusy){$eventArgs.Cancel=$true}})
+--- a/OurDLP/demo/ЧИТАТЬ.txt
++++ b/OurDLP/demo/ЧИТАТЬ.txt
+@@ -1,4 +1,4 @@
+-OurDLP 0.9.0 — комплект демонстрации на одном Windows-ПК
++OurDLP 0.9.1 — комплект демонстрации на одном Windows-ПК
+ 
+ 1. Распакуйте архив полностью в обычную папку.
+ 2. Закройте старые сервер и консоль, запущенные из Visual Studio.
+--- /dev/null
++++ b/OurDLP/tools/Measure-Resources.ps1
+@@ -0,0 +1,25 @@
++#Requires -Version 5.1
++[CmdletBinding()]
++param(
++    [ValidateRange(1,3600)][int]$DurationSeconds=60,
++    [ValidateRange(1,10)][int]$IntervalSeconds=1,
++    [ValidateSet('idle','clipboard','scan')][string]$Scenario='idle',
++    [ValidateCount(1,8)][ValidatePattern('^[A-Za-z0-9_.-]{1,80}$')][string[]]$ProcessName=@('OurDLP.Agent','OurDLP.Session'),
++    [string]$OutputDirectory=''
++)
++Set-StrictMode -Version Latest
++$ErrorActionPreference='Stop'
++. (Join-Path $PSScriptRoot 'ResourceSamples.ps1')
++if(-not $OutputDirectory){$OutputDirectory=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'OurDLP/ResourceReports'}
++$rows=[Collections.Generic.List[object]]::new();$previous=@{};$clock=[Diagnostics.Stopwatch]::StartNew();$sample=0
++Write-Host 'Замер CPU и памяти. Отчёт не содержит текстов буфера, имён пользователей, паролей и командных строк.'
++do{
++    foreach($row in @(Get-OurDlpResourceRows $ProcessName $previous $clock.Elapsed.TotalSeconds $sample)){$rows.Add($row)}
++    $sample++
++    if($clock.Elapsed.TotalSeconds -ge $DurationSeconds){break}
++    $remaining=[Math]::Max(0,[Math]::Min($IntervalSeconds,$DurationSeconds-$clock.Elapsed.TotalSeconds));if($remaining -gt 0){Start-Sleep -Milliseconds ([int]($remaining*1000))}
++}while($true)
++$report=Save-OurDlpResourceReport $rows.ToArray() $OutputDirectory $Scenario $clock.Elapsed.TotalSeconds $ProcessName.Count $true
++$report.Summary|Format-List
++Write-Host ('CSV: '+$report.Csv);Write-Host ('JSON: '+$report.Json)
++if($report.Summary.CompleteMemorySamples -eq 0){Write-Warning 'Нет полного набора доступных процессов. Отсутствующие значения не считаются нулевым потреблением.'}
+--- a/OurDLP/tools/Publish-Demo.ps1
++++ b/OurDLP/tools/Publish-Demo.ps1
+@@ -29,7 +29,7 @@
+     }
+     $apps=@{}
+     foreach($group in $groups.Keys){$apps[$group]=@($groups[$group].Keys|Sort-Object|ForEach-Object{@{Path=$_;Sha256=$groups[$group][$_]}})}
+-    @{Version='0.9.0';Apps=$apps}|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $OutputPath 'payload/apps.json') -Encoding UTF8
++    @{Version='0.9.1';Apps=$apps}|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $OutputPath 'payload/apps.json') -Encoding UTF8
+     Copy-Item -LiteralPath (Join-Path $root 'demo/launcher') -Destination (Join-Path $OutputPath 'launcher') -Recurse
+     Copy-Item -LiteralPath (Join-Path $root 'demo/assets') -Destination (Join-Path $OutputPath 'assets') -Recurse
+     Copy-Item -LiteralPath (Join-Path $root 'tools') -Destination (Join-Path $OutputPath 'tools') -Recurse
+--- /dev/null
++++ b/OurDLP/tools/ResourceSamples.ps1
+@@ -0,0 +1,60 @@
++function Get-OurDlpCpuPercent($PreviousCpu,$CurrentCpu,[double]$ElapsedSeconds,[int]$Processors){
++    if($null -eq $PreviousCpu -or $null -eq $CurrentCpu -or $ElapsedSeconds -le 0 -or $Processors -le 0 -or $CurrentCpu -lt $PreviousCpu){return $null}
++    return [Math]::Round(100.0*($CurrentCpu-$PreviousCpu)/$ElapsedSeconds/$Processors,3)
++}
++
++function Get-OurDlpResourceRows([string[]]$Names,[hashtable]$Previous,[double]$Elapsed,[int]$Sample){
++    $rows=@();$active=@{}
++    foreach($name in $Names){
++        $processes=@(Get-Process -Name $name -ErrorAction SilentlyContinue)
++        if($processes.Count -eq 0){
++            $rows+=[pscustomobject]@{Sample=$Sample;TimeUtc=[DateTime]::UtcNow.ToString('o');Process=$name;Pid=$null;WorkingSetMiB=$null;PrivateMiB=$null;CpuPercent=$null;Status='not-running'}
++        }
++        foreach($process in $processes){
++            $working=$null;$private=$null;$cpu=$null;$start=$null;$percent=$null;$status='ok';$processId=$process.Id
++            try{
++                $process.Refresh()
++                try{$working=[Math]::Round($process.WorkingSet64/1MB,3);$private=[Math]::Round($process.PrivateMemorySize64/1MB,3)}catch{$status='metrics-unavailable'}
++                try{$cpu=$process.TotalProcessorTime.TotalSeconds;$start=$process.StartTime.ToUniversalTime().Ticks}catch{$status='partial-metrics'}
++                if($null -ne $start -and $null -ne $cpu){
++                    $key=$name+'/'+$processId+'/'+$start;$active[$key]=$true
++                    if($Previous.ContainsKey($key)){$percent=Get-OurDlpCpuPercent $Previous[$key].Cpu $cpu ($Elapsed-$Previous[$key].Elapsed) ([Environment]::ProcessorCount)}
++                    $Previous[$key]=@{Cpu=$cpu;Elapsed=$Elapsed}
++                }
++            }catch{$status='process-ended'}finally{$process.Dispose()}
++            $rows+=[pscustomobject]@{Sample=$Sample;TimeUtc=[DateTime]::UtcNow.ToString('o');Process=$name;Pid=$processId;WorkingSetMiB=$working;PrivateMiB=$private;CpuPercent=$percent;Status=$status}
++        }
++    }
++    foreach($key in @($Previous.Keys)){if(-not $active.ContainsKey($key)){$Previous.Remove($key)}}
++    return $rows
++}
++
++function Get-OurDlpResourceSummary([object[]]$Rows,[int]$ExpectedNames){
++    $groups=@($Rows|Group-Object Sample);$complete=@()
++    foreach($group in $groups){
++        $items=@($group.Group)
++        if(@($items|Select-Object -ExpandProperty Process -Unique).Count -ne $ExpectedNames -or @($items|Where-Object{$_.Status -in @('not-running','process-ended') -or $null -eq $_.WorkingSetMiB -or $null -eq $_.PrivateMiB}).Count){continue}
++        $cpu=$null
++        if(@($items|Where-Object{$null -eq $_.CpuPercent}).Count -eq 0){$cpu=($items|Measure-Object CpuPercent -Sum).Sum}
++        $complete+=[pscustomobject]@{WorkingSetMiB=($items|Measure-Object WorkingSetMiB -Sum).Sum;PrivateMiB=($items|Measure-Object PrivateMiB -Sum).Sum;CpuPercent=$cpu}
++    }
++    $cpuSamples=@($complete|Where-Object{$null -ne $_.CpuPercent})
++    return [pscustomobject]@{
++        Samples=$groups.Count;CompleteMemorySamples=$complete.Count;CompleteCpuSamples=$cpuSamples.Count
++        MaxWorkingSetSumMiB=if($complete.Count){[Math]::Round(($complete|Measure-Object WorkingSetMiB -Maximum).Maximum,2)}else{$null}
++        MaxPrivateSumMiB=if($complete.Count){[Math]::Round(($complete|Measure-Object PrivateMiB -Maximum).Maximum,2)}else{$null}
++        AverageCpuPercent=if($cpuSamples.Count){[Math]::Round(($cpuSamples|Measure-Object CpuPercent -Average).Average,3)}else{$null}
++        PeakSampleCpuPercent=if($cpuSamples.Count){[Math]::Round(($cpuSamples|Measure-Object CpuPercent -Maximum).Maximum,3)}else{$null}
++        Note='Working-set sums may count shared pages more than once. CPU is normalized by logical processor count; missing metrics are null, not zero.'
++    }
++}
++
++function Save-OurDlpResourceReport([object[]]$Rows,[string]$Directory,[string]$Scenario,[double]$Elapsed,[int]$ExpectedNames,[bool]$Completed){
++    [IO.Directory]::CreateDirectory($Directory)|Out-Null
++    $name='resources-'+[DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')+'-'+[Guid]::NewGuid().ToString('N').Substring(0,8)
++    $csv=Join-Path $Directory ($name+'.csv');$json=Join-Path $Directory ($name+'.json')
++    $summary=Get-OurDlpResourceSummary $Rows $ExpectedNames
++    $Rows|Export-Csv -LiteralPath $csv -NoTypeInformation -UseCulture -Encoding UTF8
++    [pscustomobject]@{SchemaVersion=1;Scenario=$Scenario;Completed=$Completed;DurationSeconds=[Math]::Round($Elapsed,2);LogicalProcessors=[Environment]::ProcessorCount;Platform=if([Environment]::OSVersion.Platform -eq 'Win32NT'){'Windows'}else{'Portable test, not Windows'};Summary=$summary}|ConvertTo-Json -Depth 5|Set-Content -LiteralPath $json -Encoding UTF8
++    return [pscustomobject]@{Csv=$csv;Json=$json;Summary=$summary}
++}
